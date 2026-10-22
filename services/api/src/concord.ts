@@ -1255,7 +1255,7 @@ export class Concord {
     } else {
       const ratio = { num: BigInt(String(params.num)), den: BigInt(String(params.den)) };
       if (type === "split") {
-        expected = splitDeltas(snapshot, ratio, exclude);
+        expected = splitDeltas(snapshot, ratio, exclude).deltas;
         plus = ["mint"];
         minus = ["clawback"];
       } else {
