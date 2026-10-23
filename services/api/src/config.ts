@@ -81,26 +81,43 @@ function list(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function integer(env: NodeJS.ProcessEnv, name: string, fallback: number, min = 0): number {
+function integer(env: NodeJS.ProcessEnv, name: string, fallback: number, min = 0, max?: number): number {
   const raw = env[name];
   if (raw === undefined || raw === "") return fallback;
   const n = Number(raw);
-  if (!Number.isInteger(n) || n < min) throw new Error(`${name} must be a whole number of at least ${min}`);
+  if (!Number.isInteger(n) || n < min || (max !== undefined && n > max)) {
+    if (max !== undefined) {
+      throw new Error(`${name} must be a whole number from ${min} to ${max}`);
+    }
+    throw new Error(`${name} must be a whole number of at least ${min}`);
+  }
   return n;
+}
+
+function flag(env: NodeJS.ProcessEnv, name: string, fallback = false): boolean {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
+  if (v === "0" || v === "false" || v === "no" || v === "off") return false;
+  throw new Error(`${name} must be a boolean flag: 1/true/yes/on or 0/false/no/off`);
 }
 
 function endpoints(urls: string[], headers: Record<string, Record<string, string>>, name: string): Endpoint[] {
   return urls.map((url) => {
     let host: string;
+    let hostname: string;
     try {
       const parsed = new URL(url);
       if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("not http");
       host = parsed.host;
+      hostname = parsed.hostname;
     } catch {
       throw new Error(`${name} holds something that is not a URL`);
     }
     const endpoint: Endpoint = { url: url.replace(/\/+$/, "") };
-    if (headers[host]) endpoint.headers = headers[host];
+    const h = headers[host] ?? headers[hostname];
+    if (h) endpoint.headers = h;
     return endpoint;
   });
 }
@@ -124,7 +141,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   let headers: Record<string, Record<string, string>> = {};
   if (env.CONCORD_RPC_HEADERS) {
     try {
-      headers = JSON.parse(env.CONCORD_RPC_HEADERS) as Record<string, Record<string, string>>;
+      const parsed = JSON.parse(env.CONCORD_RPC_HEADERS);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error();
+      }
+      for (const hostHeaders of Object.values(parsed)) {
+        if (typeof hostHeaders !== "object" || hostHeaders === null || Array.isArray(hostHeaders)) {
+          throw new Error();
+        }
+        for (const val of Object.values(hostHeaders)) {
+          if (typeof val !== "string") {
+            throw new Error();
+          }
+        }
+      }
+      headers = parsed as Record<string, Record<string, string>>;
     } catch {
       throw new Error('CONCORD_RPC_HEADERS must be JSON: {"host": {"header": "value"}}');
     }
@@ -148,11 +179,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (signup !== "open" && signup !== "code") throw new Error("CONCORD_SIGNUP must be open or code");
 
   // Hosts such as Render hand the port over as PORT.
-  const port = integer(env, env.CONCORD_PORT ? "CONCORD_PORT" : "PORT", 4400, 1);
+  const port = integer(env, env.CONCORD_PORT ? "CONCORD_PORT" : "PORT", 4400, 1, 65535);
   const host = env.CONCORD_HOST ?? "127.0.0.1";
+  const urlHost =
+    host === "0.0.0.0" || host === "::"
+      ? "127.0.0.1"
+      : host.includes(":") && !host.startsWith("[")
+        ? `[${host}]`
+        : host;
   // Render names the service's own address in RENDER_EXTERNAL_URL.
-  let publicUrl =
-    env.CONCORD_PUBLIC_URL || env.RENDER_EXTERNAL_URL || `http://${host === "0.0.0.0" ? "127.0.0.1" : host}:${port}`;
+  let publicUrl = env.CONCORD_PUBLIC_URL || env.RENDER_EXTERNAL_URL || `http://${urlHost}:${port}`;
   try {
     publicUrl = new URL(publicUrl).origin;
   } catch {
@@ -162,16 +198,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const config: Config = {
     networks: { mainnet: network("mainnet"), testnet: network("testnet") },
     defaultNetwork,
-    dataDir: resolve(env.CONCORD_DATA_DIR ?? resolve(ROOT, "data")),
+    dataDir: env.CONCORD_DATA_DIR ? resolve(ROOT, env.CONCORD_DATA_DIR) : resolve(ROOT, "data"),
     host,
     port,
     syncIntervalSec: integer(env, "CONCORD_SYNC_INTERVAL", 30),
-    webDir: resolve(env.CONCORD_WEB_DIR ?? resolve(ROOT, "apps/web/dist")),
+    webDir: env.CONCORD_WEB_DIR ? resolve(ROOT, env.CONCORD_WEB_DIR) : resolve(ROOT, "apps/web/dist"),
     publicUrl,
     trustProxyHops: integer(env, "CONCORD_TRUST_PROXY", 0),
     signup,
     maxAssetsPerOrg: integer(env, "CONCORD_MAX_ASSETS", 10, 1),
-    ephemeral: env.CONCORD_EPHEMERAL === "1" || env.CONCORD_EPHEMERAL === "true",
+    ephemeral: flag(env, "CONCORD_EPHEMERAL", false),
   };
   if (env.CONCORD_PASSWORD_COST) {
     // N:r:p. Each stored hash carries the factors it was made with, so this can change at any time.

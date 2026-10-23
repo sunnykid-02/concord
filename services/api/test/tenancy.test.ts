@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { StrKey } from "@stellar/stellar-sdk";
 import { Auth } from "../src/auth.js";
 import { StellarSource } from "../src/chain.js";
 import { Concord } from "../src/concord.js";
@@ -229,8 +230,8 @@ describe("workspace isolation", () => {
     try {
       const alphaDb = tenants.forOrg(alpha).db;
       const betaDb = tenants.forOrg(beta).db;
-      alphaDb.run("INSERT INTO meta (key, value) VALUES ('sample', 'ALPHA ONLY')");
-      betaDb.run("INSERT INTO meta (key, value) VALUES ('sample', 'BETA ONLY')");
+      alphaDb.insert("INSERT INTO meta (key, value) VALUES ('sample', 'ALPHA ONLY')");
+      betaDb.insert("INSERT INTO meta (key, value) VALUES ('sample', 'BETA ONLY')");
 
       // SQLite holds its WAL and shared-memory files while both handles are open.
       expect(files()).toEqual([...paths(alpha), ...paths(beta)].sort());
@@ -639,6 +640,41 @@ describe("networks", () => {
     for (const weak of ["1024:8:1", "20000:8:1", "32768:8", "nope"]) {
       expect(() => loadConfig({ CONCORD_PASSWORD_COST: weak }), weak).toThrow(/CONCORD_PASSWORD_COST/);
     }
+    expect(() => loadConfig({ PORT: "70000" })).toThrow("PORT must be a whole number from 1 to 65535");
+
+    const withHeaders = loadConfig({
+      CONCORD_MAINNET_RPC_URLS: "https://x.example:8443/rpc, https://y.example:8443/rpc, https://z.example/rpc",
+      CONCORD_RPC_HEADERS: JSON.stringify({
+        "x.example": { "x-api-key": "fallback-key" },
+        "y.example": { "x-api-key": "hostname-key" },
+        "y.example:8443": { "x-api-key": "exact-key" },
+        "z.example": { "x-api-key": "standard-key" },
+      }),
+    });
+    expect(withHeaders.networks.mainnet.rpc[0]?.headers).toEqual({ "x-api-key": "fallback-key" });
+    expect(withHeaders.networks.mainnet.rpc[1]?.headers).toEqual({ "x-api-key": "exact-key" });
+    expect(withHeaders.networks.mainnet.rpc[2]?.headers).toEqual({ "x-api-key": "standard-key" });
+    for (const truthy of ["1", "true", "TRUE", "True", "yes", "YES", "on", "ON"]) {
+      expect(loadConfig({ CONCORD_EPHEMERAL: truthy }).ephemeral, truthy).toBe(true);
+    }
+    for (const falsy of ["0", "false", "FALSE", "False", "no", "NO", "off", "OFF"]) {
+      expect(loadConfig({ CONCORD_EPHEMERAL: falsy }).ephemeral, falsy).toBe(false);
+    }
+    expect(loadConfig({}).ephemeral).toBe(false);
+    for (const junk of ["maybe", "2", "none", "enabled"]) {
+      expect(() => loadConfig({ CONCORD_EPHEMERAL: junk }), junk).toThrow(/CONCORD_EPHEMERAL must be a boolean flag/);
+    }
+    expect(loadConfig({ CONCORD_RPC_HEADERS: '{"mainnet.sorobanrpc.com": {"Authorization": "Bearer token"}}' })).toBeDefined();
+    for (const invalid of [
+      "null",
+      "[]",
+      '{"mainnet.sorobanrpc.com": "Bearer token"}',
+      '{"mainnet.sorobanrpc.com": {"Authorization": 123}}',
+      '{"mainnet.sorobanrpc.com": null}',
+      '{"mainnet.sorobanrpc.com": ["header"]}',
+    ]) {
+      expect(() => loadConfig({ CONCORD_RPC_HEADERS: invalid }), invalid).toThrow(/CONCORD_RPC_HEADERS must be JSON/);
+    }
   });
 });
 
@@ -713,6 +749,22 @@ describe("chain endpoints", () => {
     const source = new StellarSource(network([a, "https://b.example"]), deps);
     await expect(source.getEvents("C", { startLedger: 1 }, 10)).rejects.toThrow(/ledger range/);
     expect(calls).toHaveLength(1);
+  });
+
+  it("produces a descriptive ChainError when RPC returns null or missing result", async () => {
+    const a = "https://a.example";
+    const { deps: nullDeps } = scripted({
+      [a]: [
+        () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null })),
+        () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: null })),
+        () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1 })),
+      ],
+    });
+    const source = new StellarSource(network([a]), nullDeps);
+    await expect(source.getEvents("C", { startLedger: 1 }, 10)).rejects.toThrow("Stellar RPC getEvents returned no result");
+    await expect(source.latestLedger()).rejects.toThrow("Stellar RPC getHealth returned no result");
+    const contractId = StrKey.encodeContract(Buffer.alloc(32, 1));
+    await expect(source.describe({ id: contractId })).rejects.toThrow("Stellar RPC getLedgerEntries returned no result");
   });
 
   it("does not rest an endpoint on request faults (400, 404, 422)", async () => {
@@ -928,6 +980,16 @@ describe("what ships", () => {
     }).toThrow("original failure");
   });
 
+  it("treats a second close as a no-op and reports a closed database on later use", () => {
+    const db = new Db(":memory:", ["CREATE TABLE t (k TEXT);"]);
+    db.all("SELECT * FROM t");
+    db.close();
+    expect(() => db.close()).not.toThrow();
+    // The statement above was cached; left in the cache it fails with "statement has been finalized".
+    expect(() => db.all("SELECT * FROM t")).toThrow("database is not open");
+    expect(() => db.tx(() => 1)).toThrow("database is not open");
+  });
+
   it("does not serve files reached through encoded dot-dot with immutable caching", async () => {
     const dir = mkdtempSync(join(tmpdir(), "concord-static-"));
     const webDir = join(dir, "web");
@@ -1059,4 +1121,73 @@ describe("what ships", () => {
     }
   });
 
+  it("brackets IPv6 hosts and maps :: to 127.0.0.1 for publicUrl", () => {
+    const cfgLoopback = loadConfig({ CONCORD_HOST: "::1", CONCORD_PORT: "4400" });
+    expect(cfgLoopback.publicUrl).toBe("http://[::1]:4400");
+
+    const cfgAny = loadConfig({ CONCORD_HOST: "::", CONCORD_PORT: "4400" });
+    expect(cfgAny.publicUrl).toBe("http://127.0.0.1:4400");
+  });
+  it("serves static files with correct MIME types for Vite assets and falls back to octet-stream", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "concord-mime-"));
+    const dataDir = join(dir, "data");
+    const webDir = join(dir, "web");
+    mkdirSync(dataDir);
+    mkdirSync(webDir);
+
+    const testFiles: Record<string, string> = {
+      "bundle.js.map": "application/json",
+      "manifest.webmanifest": "application/manifest+json",
+      "robots.txt": "text/plain; charset=utf-8",
+      "feed.xml": "application/xml",
+      "module.wasm": "application/wasm",
+      "font.woff": "font/woff",
+      "photo.jpg": "image/jpeg",
+      "photo.jpeg": "image/jpeg",
+      "anim.gif": "image/gif",
+      "pic.webp": "image/webp",
+      "pic.avif": "image/avif",
+      "unknown.xyz": "application/octet-stream",
+    };
+
+    for (const file of Object.keys(testFiles)) {
+      writeFileSync(join(webDir, file), "sample-content");
+    }
+
+    const cfg = loadConfig({
+      CONCORD_DATA_DIR: dataDir,
+      CONCORD_WEB_DIR: webDir,
+      CONCORD_SIGNUP: "open",
+    });
+    const control = new Db(join(dataDir, "control.db"), CONTROL_MIGRATIONS);
+    const auth = new Auth(control, { signup: "open" });
+    const tenants = new Tenants(fileStore(dataDir), {}, () => false, () => []);
+    const runtime = { control, auth, tenants, close: () => { tenants.close(); control.close(); } };
+    const app = createServerApp(runtime, cfg);
+
+    try {
+      for (const [file, expectedMime] of Object.entries(testFiles)) {
+        const res = await app.request(`/${file}`);
+        expect(res.status, file).toBe(200);
+        expect(res.headers.get("content-type"), file).toBe(expectedMime);
+      }
+    } finally {
+      runtime.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Db", () => {
+  it("returns changed-row counts for UPDATE and DELETE, never a stale row id (#79)", () => {
+    const db = new Db(":memory:", ["CREATE TABLE t (k TEXT PRIMARY KEY, v TEXT NOT NULL);"]);
+    expect(db.insert("INSERT INTO t (k, v) VALUES ('a', '1')")).toBe(1);
+    expect(db.insert("INSERT INTO t (k, v) VALUES ('b', '2')")).toBe(2);
+    expect(db.write("UPDATE t SET v = 'x'")).toBe(2);
+    expect(db.write("UPDATE t SET v = 'y' WHERE k = 'missing'")).toBe(0);
+    expect(db.write("DELETE FROM t WHERE k = 'a'")).toBe(1);
+    expect(db.write("DELETE FROM t WHERE k = 'a'")).toBe(0);
+    expect(db.write("INSERT OR IGNORE INTO t (k, v) VALUES ('b', 'dup')")).toBe(0);
+    expect("run" in db).toBe(false);
+  });
 });
