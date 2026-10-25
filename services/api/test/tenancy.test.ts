@@ -2,7 +2,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { Worker } from "node:worker_threads";
 import { describe, expect, it } from "vitest";
+import { readFileSync as readFixture } from "node:fs";
 import { StrKey } from "@stellar/stellar-sdk";
 import { Auth } from "../src/auth.js";
 import { StellarSource } from "../src/chain.js";
@@ -559,6 +561,24 @@ describe("Google sign-in", () => {
     expect((await new Client(h.app).call("/api/auth/google/start?link=1")).status).toBe(401);
   });
 
+  it("normalizes long Google names and reports invalid email without a mismatch message", async () => {
+    const renamed = withGoogle(good("longname@example.test", { name: "N".repeat(140) }));
+    const first = new Client(renamed.h.app);
+    const start = await begin(renamed.h, first);
+    renamed.box.nonce = start.nonce;
+    const done = await first.call(`/api/auth/google/callback?code=abc&state=${start.state}`);
+    expect(done.headers.get("location")).toBe(`${ORIGIN}/#/`);
+    const me = await first.json<{ user: { name: string } }>("/api/auth/me");
+    expect(me.user.name).toBe("N".repeat(80));
+
+    const malformed = withGoogle(good("invalid-email", { email: "invalid-email" }));
+    const second = new Client(malformed.h.app);
+    const state = await begin(malformed.h, second);
+    malformed.box.nonce = state.nonce;
+    const failure = await second.call(`/api/auth/google/callback?code=abc&state=${state.state}`);
+    expect(failure.headers.get("location")).toBe(`${ORIGIN}/#/signin?error=google_invalid_email`);
+  });
+
   it("rejects a forged state, a stale token and an unverified address", async () => {
     const forged = withGoogle(good("gail@example.test"));
     const c1 = new Client(forged.h.app);
@@ -621,6 +641,20 @@ describe("networks", () => {
       concord.createAction(onMain.id, { type: "dividend", recordTime: at(5), ratePerUnit: "1", payAsset: onTest.id }),
     ).rejects.toThrow(/same network/);
     await expect(concord.watchAsset({ network: "devnet" as "testnet", asset: `FUND:${issuer}` })).rejects.toThrow(/mainnet or testnet/);
+  });
+
+  it("rejects a CONCORD_PUBLIC_URL with a path instead of silently dropping it", () => {
+    // A sub-path used to be trimmed to the origin, so cookies and the OAuth
+    // redirect quietly pointed at the wrong place. Now it is named as the
+    // configuration error it is.
+    expect(() => loadConfig({ CONCORD_PUBLIC_URL: "https://x.example/concord" })).toThrow(
+      /sub-path hosting is not supported.*https:\/\/x\.example/,
+    );
+    expect(() => loadConfig({ CONCORD_PUBLIC_URL: "https://x.example/?tenant=a" })).toThrow(/query/);
+    // A trailing slash alone is still accepted, and still normalizes to the origin.
+    expect(loadConfig({ CONCORD_PUBLIC_URL: "https://x.example/" }).publicUrl).toBe("https://x.example");
+    expect(loadConfig({ CONCORD_PUBLIC_URL: "https://x.example" }).publicUrl).toBe("https://x.example");
+    expect(() => loadConfig({ CONCORD_PUBLIC_URL: "not a url" })).toThrow(/must be a URL/);
   });
 
   it("serves both networks with public endpoints by default and names retired settings", () => {
@@ -721,6 +755,30 @@ describe("chain endpoints", () => {
     return { calls, clock, deps };
   }
 
+  it("URL-encodes unusual asset and issuer values in search, describe and baseline", async () => {
+    const code = "A&B?";
+    const issuer = "G?X&Y";
+    const h = "https://horizon.example";
+    const emptyAssets = () => new Response(JSON.stringify({ _embedded: { records: [] } }));
+    const emptyAccounts = () => new Response(JSON.stringify({ _embedded: { records: [] } }), {
+      headers: { "latest-ledger": "42" },
+    });
+    const { calls, deps } = scripted({
+      [`${h}/assets?asset_code=A%26B%3F&limit=200`]: [emptyAssets],
+      [`${h}/assets?asset_code=A%26B%3F&asset_issuer=G%3FX%26Y&limit=200`]: [emptyAssets],
+      [`${h}/accounts?asset=A%26B%3F%3AG%3FX%26Y&limit=200&order=asc`]: [emptyAccounts],
+    });
+    const source = new StellarSource(network(["https://rpc.example"]), deps);
+    expect(await source.search(code)).toEqual([]);
+    expect(await source.describe({ id: "unused", code, issuer })).toBeUndefined();
+    expect(await source.baseline(code, issuer, 7)).toEqual({ ledger: 42, openings: new Map() });
+    expect(calls.map((call) => call.url)).toEqual([
+      `${h}/assets?asset_code=A%26B%3F&limit=200`,
+      `${h}/assets?asset_code=A%26B%3F&asset_issuer=G%3FX%26Y&limit=200`,
+      `${h}/accounts?asset=A%26B%3F%3AG%3FX%26Y&limit=200&order=asc`,
+    ]);
+  });
+
   it.each([
     ["600", 600_000],
     [new Date(1_600_000).toUTCString(), 600_000],
@@ -787,11 +845,41 @@ describe("chain endpoints", () => {
   it("does not retry a request the RPC rejected", async () => {
     const a = "https://a.example";
     const { calls, deps } = scripted({
-      [a]: [() => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { message: "startLedger must be within the ledger range" } }))],
+      [a]: [() => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "startLedger must be within the ledger range" } }))],
     });
     const source = new StellarSource(network([a, "https://b.example"]), deps);
     await expect(source.getEvents("C", { startLedger: 1 }, 10)).rejects.toThrow(/ledger range/);
     expect(calls).toHaveLength(1);
+  });
+
+  it("fails over to the next endpoint and rests the endpoint on rate-limit and transient JSON-RPC errors", async () => {
+    const a = "https://a.example";
+    const b = "https://b.example";
+    const { calls, clock, deps } = scripted({
+      [a]: [() => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { message: "rate limit exceeded" } }))],
+      [b]: [health, health],
+    });
+    const source = new StellarSource(network([a, b]), deps);
+    const head = await source.latestLedger();
+    expect(head.latest).toBe(50);
+    expect(calls.map((c) => c.url)).toEqual([a, b]);
+
+    // Endpoint `a` was rested, so the next call goes directly to `b` (once the head cache lapses)
+    clock.value += 3_000;
+    await source.latestLedger();
+    expect(calls.map((c) => c.url)).toEqual([a, b, b]);
+
+    // Also fails over on internal/behind error (-32603 or 'behind')
+    const c = "https://c.example";
+    const d = "https://d.example";
+    const script2 = scripted({
+      [c]: [() => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32603, message: "node is behind" } }))],
+      [d]: [health],
+    });
+    const source2 = new StellarSource(network([c, d]), script2.deps);
+    const head2 = await source2.latestLedger();
+    expect(head2.latest).toBe(50);
+    expect(script2.calls.map((call) => call.url)).toEqual([c, d]);
   });
 
   it("produces a descriptive ChainError when RPC returns null or missing result", async () => {
@@ -858,7 +946,7 @@ describe("chain endpoints", () => {
     const line = (balance: string, authorized = true) => ({ asset_code: "FUND", asset_issuer: issuer, balance, is_authorized: authorized });
     const record = (id: string, balance: string) => ({ account_id: id, balances: [line(balance)] });
     const many = Array.from({ length: 199 }, () => record(key(), "1.0000000"));
-    const first = `https://horizon.example/accounts?asset=FUND:${issuer}&limit=200&order=asc`;
+    const first = `https://horizon.example/accounts?asset=FUND%3A${issuer}&limit=200&order=asc`;
     const second = "https://horizon.example/accounts?cursor=abc&limit=200";
     const page = (records: unknown[], ledger: number, next?: string) => () =>
       new Response(JSON.stringify({ _links: next ? { next: { href: next } } : {}, _embedded: { records } }), {
@@ -938,8 +1026,8 @@ describe("chain endpoints", () => {
       headers: { "latest-ledger": "100" },
     });
     const s2 = scripted({
-      [`${h1}/accounts?asset=FOO:${issuer}&limit=200&order=asc`]: [badBody],
-      [`${h2}/accounts?asset=FOO:${issuer}&limit=200&order=asc`]: [okAccounts],
+      [`${h1}/accounts?asset=FOO%3A${issuer}&limit=200&order=asc`]: [badBody],
+      [`${h2}/accounts?asset=FOO%3A${issuer}&limit=200&order=asc`]: [okAccounts],
     });
     const src2 = new StellarSource(net, s2.deps);
     const baseRes = await src2.baseline("FOO", issuer, 7);
@@ -1045,6 +1133,75 @@ describe("what ships", () => {
       expect(reopened.get<{ user_version: number }>("PRAGMA user_version")?.user_version).toBe(1);
       reopened.close();
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("locks a WAL write transaction before reading to prevent stale snapshot writes", () => {
+    const dir = mkdtempSync(join(tmpdir(), "concord-db-busy-"));
+    const file = join(dir, "shared.db");
+    const schema = ["CREATE TABLE tally (n INTEGER NOT NULL); INSERT INTO tally VALUES (0);"];
+    let first: Db | undefined;
+    let second: Db | undefined;
+    try {
+      first = new Db(file, schema);
+      second = new Db(file, schema);
+      // Keep contention tests fast: waiting longer cannot help a nested synchronous write.
+      first.raw.exec("PRAGMA busy_timeout = 1");
+      second.raw.exec("PRAGMA busy_timeout = 1");
+      for (let i = 0; i < 20; i++) {
+        first.tx(() => {
+          const n = first!.get<{ n: number }>("SELECT n FROM tally")!.n;
+          expect(() => second!.write("UPDATE tally SET n = n + 1")).toThrow(/locked/i);
+          first!.write("UPDATE tally SET n = ?", n + 1);
+        });
+        second.tx(() => {
+          const n = second!.get<{ n: number }>("SELECT n FROM tally")!.n;
+          expect(() => first!.write("UPDATE tally SET n = n + 1")).toThrow(/locked/i);
+          second!.write("UPDATE tally SET n = ?", n + 1);
+        });
+      }
+      expect(first.get<{ n: number }>("SELECT n FROM tally")?.n).toBe(40);
+      expect(second.get<{ n: number }>("SELECT n FROM tally")?.n).toBe(40);
+    } finally {
+      first?.close();
+      second?.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for an exclusive SQLite lock while enabling WAL on a newly created file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "concord-db-wal-open-"));
+    const file = join(dir, "shared.db");
+    const worker = new Worker(
+      `
+        const { parentPort, workerData } = require("node:worker_threads");
+        const { DatabaseSync } = require("node:sqlite");
+        const db = new DatabaseSync(workerData.file);
+        db.exec("BEGIN EXCLUSIVE");
+        parentPort.postMessage("locked");
+        setTimeout(() => {
+          db.exec("COMMIT");
+          db.close();
+          parentPort.postMessage("released");
+        }, 300);
+      `,
+      { eval: true, workerData: { file } },
+    );
+    try {
+      await new Promise<void>((resolve, reject) => {
+        worker.once("message", () => resolve());
+        worker.once("error", reject);
+        worker.once("exit", (code) => {
+          if (code !== 0) reject(new Error(`SQLite lock worker exited with ${code}`));
+        });
+      });
+      // Busy timeout must be installed BEFORE journal_mode requests its lock.
+      const opened = new Db(file, ["CREATE TABLE messages (id INTEGER)"]);
+      expect(opened.get<{ user_version: number }>("PRAGMA user_version")?.user_version).toBe(1);
+      opened.close();
+    } finally {
+      await worker.terminate();
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -1206,6 +1363,17 @@ describe("what ships", () => {
     }
   });
 
+  it("resolves relative CONCORD_DATA_DIR and CONCORD_WEB_DIR against the repo root, not the cwd", () => {
+    // pnpm runs the API with its cwd at services/api; ROOT is two directories above that.
+    const root = join(import.meta.dirname, "../../..");
+    const cfg = loadConfig({ CONCORD_DATA_DIR: "./rel-data", CONCORD_WEB_DIR: "./rel-web" });
+    expect(cfg.dataDir).toBe(join(root, "rel-data"));
+    expect(cfg.webDir).toBe(join(root, "rel-web"));
+    // Absolute paths are left alone, and the defaults sit under the root as well.
+    expect(loadConfig({ CONCORD_DATA_DIR: "/srv/concord/data" }).dataDir).toBe("/srv/concord/data");
+    expect(loadConfig({}).dataDir).toBe(join(root, "data"));
+  });
+
   it("brackets IPv6 hosts and maps :: to 127.0.0.1 for publicUrl", () => {
     const cfgLoopback = loadConfig({ CONCORD_HOST: "::1", CONCORD_PORT: "4400" });
     expect(cfgLoopback.publicUrl).toBe("http://[::1]:4400");
@@ -1213,6 +1381,7 @@ describe("what ships", () => {
     const cfgAny = loadConfig({ CONCORD_HOST: "::", CONCORD_PORT: "4400" });
     expect(cfgAny.publicUrl).toBe("http://127.0.0.1:4400");
   });
+
   it("serves static files with correct MIME types for Vite assets and falls back to octet-stream", async () => {
     const dir = mkdtempSync(join(tmpdir(), "concord-mime-"));
     const dataDir = join(dir, "data");
