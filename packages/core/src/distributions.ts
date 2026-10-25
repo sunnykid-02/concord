@@ -42,13 +42,16 @@ export function dividendEntitlements(snapshot: HoldingsState, terms: DividendTer
 }
 
 /**
- * Result of a split: the balance deltas to apply, plus the fractional remainder
- * dropped by flooring for each holder. In a reverse split the remainder is the
- * cash-in-lieu basis — the auditor must be able to see exactly what was lost.
+ * Result of a split: the balance deltas to apply, plus what flooring dropped for each holder.
+ * In a reverse split that is the cash-in-lieu basis, so an auditor can see exactly what was lost.
  */
 export interface SplitResult {
   deltas: ExpectedFlows;
-  /** Per-holder fractional remainder dropped by flooring, in smallest units of the asset. */
+  /**
+   * Per holder, the remainder of `units * num / den`: the dropped fraction is `remainder / den` of
+   * the smallest unit. Every remainder shares the denominator `den`, so they add up exactly.
+   * Holders with nothing dropped are absent.
+   */
   fractions: Map<string, bigint>;
 }
 

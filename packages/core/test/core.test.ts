@@ -749,7 +749,8 @@ describe("corporate actions", () => {
     // Deltas unchanged from previous behaviour
     expect(deltas.get("H1")).toBe(-5n);
     expect(deltas.get("H2")).toBe(-7n);
-    expect(deltas.get("H3")).toBe(-13n);
+    expect(deltas.get("H3")).toBe(-12n);
+    // 13 units at 1:10 keep floor(13 / 10) = 1, so the delta is -12 and 3/10 of a unit is dropped.
     // Fractions: 5%10=5, 7%10=7, 13%10=3 → sum = 15
     expect(fractions.get("H1")).toBe(5n);
     expect(fractions.get("H2")).toBe(7n);
@@ -757,6 +758,11 @@ describe("corporate actions", () => {
     let sum = 0n;
     for (const r of fractions.values()) sum += r;
     expect(sum).toBe(15n);
+    // Nothing is created or lost: kept units * den + remainder = units * num, for every holder.
+    for (const [address, units] of snap.balances) {
+      const kept = units + (deltas.get(address) ?? 0n);
+      expect(kept * 10n + (fractions.get(address) ?? 0n)).toBe(units * 1n);
+    }
   });
 
   it("does not count zero/zero netted-out flows in summary.holders while keeping txHashes", () => {
